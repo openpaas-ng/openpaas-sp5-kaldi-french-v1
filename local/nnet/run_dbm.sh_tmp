@@ -1,0 +1,82 @@
+#!/bin/bash
+
+. ./path.sh
+
+# Config:
+exp_dir=exp/nnet
+gmmdir=exp/tri4a
+data_fmllr=$exp_dir/data-fmllr
+stage_dbm=2 # resume training with --stage=N
+# End of config.
+. utils/parse_options.sh || exit 1;
+#
+
+if [ $stage_dbm -le 0 ]; then
+  # Store fMLLR features, so we can train on them easily,
+  # dev data
+  dir=$data_fmllr/dev
+  steps/nnet/make_fmllr_feats.sh --nj 2 \
+     --transform-dir $gmmdir/decode_dev_KALDI \
+     $dir data/dev $gmmdir $dir/log $dir/data || exit 0
+
+  # test data
+  dir=$data_fmllr/test
+  steps/nnet/make_fmllr_feats.sh --nj 4 \
+     --transform-dir $gmmdir/decode_test_KALDI \
+     $dir data/test $gmmdir $dir/log $dir/data || exit 0
+
+  # train
+  dir=$data_fmllr/train
+  steps/nnet/make_fmllr_feats.sh --nj 10 \
+     --transform-dir exp/tri4a_ali \
+     $dir data/train $gmmdir $dir/log $dir/data || exit 0
+
+  # split the data : 90% train 10% cross-validation (held-out)
+  utils/subset_data_dir_tr_cv.sh $dir ${dir}_tr90 ${dir}_cv10 || exit 0
+fi
+
+
+###
+### Now we can pre-train stack of RBMs
+###
+
+cmd=run.pl
+depth=5
+nn_depth=7
+if [ $stage_dbm -le 1 ]; then
+  # Pre-train DBN, i.e. a stack of RBMs
+  dir=$exp_dir/pretrain-${depth}dbn
+  [ ! -d $dir ] && mkdir $dir
+  $cmd $dir/log/pretrain_dbn.log \
+    steps/nnet/pretrain_dbn.sh --rbm-iter 1 --nn-depth $nn_depth $data_fmllr/train $dir || exit 0;
+fi
+
+
+
+###
+### Now we train the DNN optimizing cross-entropy.
+### This will take quite some time.
+###
+
+# Train the DNN optimizing per-frame cross-entropy,
+if [ $stage_dbm -le 2 ]; then
+  dir=$exp_dir/dnn_pretrain-${depth}dbn
+  ali=exp/tri4a_ali
+  feature_transform=$exp_dir/pretrain-${depth}dbn/final.feature_transform
+  dbn=$exp_dir/pretrain-${depth}dbn/$nn_depth.dbn
+  # Train
+  $cmd $dir/log/train_nnet.log \
+    steps/nnet/train.sh --feature-transform $feature_transform --dbn $dbn --hid-layers 0 --learn-rate 0.008 \
+    $data_fmllr/train_tr90 $data_fmllr/train_cv10 data/lang $ali $ali $dir
+  # Decode
+  njobs=2
+  for lm in IRSTLM KALDI; do
+     steps/nnet/decode.sh --nj $njobs --config conf/decode_dnn.conf \
+       exp/tri4a/graph_$lm $data_fmllr/dev $dir/decode_dev_$lm
+  done
+  for x in $dir/decode_*; do
+    [ -d $x ] && [[ $x =~ "$1" ]] && grep WER $x/wer_* | utils/best_wer.sh
+  done
+
+fi
+
